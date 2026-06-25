@@ -1,0 +1,169 @@
+Pre-requisites
+ * GCP project with billing enabled
+ * GCP cloud storage bucket (where book page images get uploaded)
+ * Cloud Run function on storage-bucket file creation/finalization (the trigger
+   that wakes our code up every time a new image is added)
+ * GCP APIs enabled in the project:
+    - Cloud Vision API         (image -> text)
+    - Cloud Translation API    (Portuguese -> English)
+    - BigQuery API             (store the results)
+ * Service account for the Cloud Run function with permissions to:
+    - Read objects from the storage bucket
+    - Call the Vision API
+    - Call the Translation API
+    - Query AND insert rows in the BigQuery table
+      (query is needed for the idempotency check in step 0c)
+
+ * BigQuery dataset + table. THIS IS THE REAL, CURRENT SCHEMA
+   (project: library-stephanie, dataset: book_translation, table: scanned_pages).
+   All four columns are REQUIRED (every row must have a value — not NULL;
+   an empty string "" still counts as a value):
+
+        page_number      INTEGER   REQUIRED   the page's number
+        page_text        STRING    REQUIRED   PT_BR raw text from Vision (OCR)
+        translated_text  STRING    REQUIRED   EN translation from Translate
+        validated        BOOLEAN   REQUIRED   has a human checked it yet? (starts False)
+
+   The CREATE TABLE that matches the code (run once if rebuilding the table):
+
+        CREATE TABLE `library-stephanie.book_translation.scanned_pages` (
+            page_number     INT64   NOT NULL,
+            page_text       STRING  NOT NULL,
+            translated_text STRING  NOT NULL,
+            validated       BOOL    NOT NULL
+        );
+
+   OPEN QUESTION about the schema: the only identifier is `page_number`, an
+   INTEGER. If the book's files repeat page numbers across chapters
+   (chapter-01/page-001.jpg AND chapter-02/page-001.jpg both -> page 1) then
+   two different pages collide: the idempotency check (step 0c) would treat the
+   second as "already done" and skip it. If that can happen, add a
+   `file_name STRING` column and dedupe on that instead of on page_number.
+
+ * Python dependencies (requirements.txt):
+    - functions-framework
+    - google-cloud-vision
+    - google-cloud-translate
+    - google-cloud-bigquery
+
+
+function Page Processing:
+input  cloud storage file (a page image)
+output one row in BigQuery: page number, original text, translated text, validated flag
+
+
+=============================================================================================================================
+WHY THE SAFEGUARDS BELOW EXIST (read this first)
+
+Cloud Storage events are delivered "at least once": Google can call our
+function more than once for the same file — especially if a previous run
+raised an error, but sometimes on its own. Our recipe calls TWO paid APIs
+(Vision, then Translate) BEFORE it saves anything. So if the function crashes
+part-way, it gets retried, which re-runs those paid APIs, which can loop and
+run up a bill. Step 0 (filtering + idempotency) and the error handling in
+step 3 exist to break that loop.
+=============================================================================================================================
+
+
+recipe
+
+step 0 - GUARD THE DOOR (safeguards, before any paid work) - new
+    input:  the event data from the trigger (bucket, file name, ...)
+    output: either we stop early, or we have a valid integer page number to use
+
+  0a. filter out non-image uploads
+    i.   look at the file name's extension (.jpg, .png, ...), lowercased
+    ii.  if it is not an image, RETURN (report success so it is NOT retried) —
+         nothing to OCR
+  0b. work out the page number (INTEGER, because that is the column type)
+    i.   the file name is a STRING like "chapter-01/page-001.jpg"
+    ii.  take just the file part (drop any "folder/" in front) so chapter digits
+         don't get mistaken for the page
+    iii. pull the digits out and convert to an int -> page_number
+    iv.  if there is no number to find, RETURN (we can't build a valid row)
+  0c. idempotency check ("did we already do this page?")
+    i.   ask BigQuery: SELECT COUNT(*) ... WHERE page_number = @page_number
+         (use a query PARAMETER, not string-pasting, to stay safe)
+    ii.  if the count is > 0, the page is already saved -> RETURN (skip the
+         paid Vision + Translate calls and avoid a duplicate row)
+    iii. if the check itself errors, "fail open": carry on (step 3 still
+         protects us), don't crash
+
+
+step 1 - convert image to text (Vision API) - SCAN
+    input:  cloud storage bucket name + file name (both come from the trigger)
+    output: text string containing the extracted page text (Portuguese)
+
+  a. get cloud storage filename (passed by cloud function trigger)
+    i.   read 'bucket' from the event data        (e.g. "my-book-pages")
+    ii.  read 'name'   from the event data        (e.g. "chapter-01/page-001.jpg")
+    iii. build the Vision API "filename" as a GCS URI by combining them:
+            gs://{bucket}/{name}
+         (the gs:// prefix tells Vision to read the file straight out of
+          Cloud Storage — we don't have to download it ourselves)
+
+  b. pass filename to Vision API and get response
+    i.   create a Vision API client
+            (auth is handled automatically by the function's service account)
+    ii.  build a Vision Image object that points at the GCS URI
+    iii. call client.text_detection(image=image) to run OCR on the image
+    iv.  check response.error — if Vision reports a problem, stop and raise
+         (the error handler in step 3 catches it and stops the event)
+
+  c. parse response structure into text format
+    i.   response.text_annotations is a list of detected text regions
+    ii.  the FIRST entry (index 0) contains the FULL page text combined together
+    iii. the remaining entries are individual words/lines with bounding-box
+         coordinates — useful for highlighting on the image, but we don't need
+         them for translation, so we ignore them
+    iv.  if the list is empty, the page had no readable text — return ""
+
+  d. output page text as string
+    i.   return text_annotations[0].description
+    ii.  this string is the input to step 2 (translation)
+
+
+step 2 - translate Portuguese to English (Translation API)
+    input:  the text string from step 1
+    output: the same text translated into English
+
+  a. if the text is empty (blank page), return "" — no point paying for an
+     empty translation
+  b. create a Translation client
+  c. call translate(text, source_language="pt-BR", target_language="en-CA")
+  d. the API returns a dictionary; read result["translatedText"]
+  e. output the English string for step 3
+
+
+step 3 - store it in BigQuery (with error containment)
+    input:  page_number, page_text (PT), translated_text (EN)
+    output: one new row appended to scanned_pages
+
+  a. build ONE row as a dictionary whose keys are exactly the 4 column names:
+        page_number     = the int from step 0b
+        page_text       = Portuguese text from step 1
+        translated_text = English text from step 2
+        validated       = False   (no human has checked it yet)
+  b. load it with write_disposition = WRITE_APPEND (add, never overwrite),
+     spelling out the schema (names + types + REQUIRED) so a wrong type fails
+     loudly with a clear message instead of silently misbehaving
+  c. wait for the load job to finish; if it failed, log load_job.errors (the
+     specific per-row reason) and raise
+  d. WRAP steps 1-3 in try/except: on ANY error, log it and RETURN normally
+     (do NOT re-raise). Returning success tells Google "handled", so the event
+     is NOT retried and we don't loop on the paid APIs. Trade-off: a temporary
+     glitch won't auto-retry either — re-upload the page by hand to redo it.
+     (If you later want retries for transient errors only, raise for those and
+     return for permanent ones.)
+
+
+step 4 - verify the data is in BigQuery
+    - query the table and eyeball a few rows:
+        SELECT page_number, validated, LEFT(translated_text, 80) AS preview
+        FROM `library-stephanie.book_translation.scanned_pages`
+        ORDER BY page_number;
+    - rows start with validated = False; a human reads the translation and,
+      once happy, flips it:
+        UPDATE `library-stephanie.book_translation.scanned_pages`
+        SET validated = TRUE
+        WHERE page_number = 1;     -- always use WHERE (README Part 5.8)
